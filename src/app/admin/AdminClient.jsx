@@ -97,23 +97,19 @@ async function softDeleteOrder(id) {
 
 /** ----------------- LINE (ถ้าใช้อยู่เดิม) ----------------- */
 /** เรียกใช้ API ฝั่ง server เพื่อส่งแจ้งเตือน LINE */
-async function lineNotifySend(message, imageUrl) {
-  try {
-    const res = await fetch("/api/line-notify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, imageUrl }),
-    });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      console.warn("LINE notify failed:", res.status, txt);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.warn("LINE notify error:", e?.message || e);
+/** ----------------- LINE Messaging API ----------------- */
+async function pushLine({ text, imageUrl, to, broadcast = false }) {
+  const res = await fetch("/api/line/push", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, imageUrl, to, broadcast }),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.warn("LINE push failed:", res.status, txt);
     return false;
   }
+  return true;
 }
 
 /** ----------------- Email ----------------- */
