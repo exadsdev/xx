@@ -1,23 +1,26 @@
+/* app/admin/AdminClient.jsx */
+
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import "bootstrap/dist/css/bootstrap.min.css";
 
 /**
- * Admin Page (works with backend /messages/:id and /status/:id)
+ * Admin Page
+ * - Poll orders
+ * - Send LINE Messaging API push when new orders arrive
  *
- * - Slip thumbnail column
- * - Soft delete -> PATCH status to DELETED (fallback CANCELLED)
- * - Save admin notes -> PUT /messages/:id with { detels }
- *
- * ENV (Next.js):
+ * ENV:
  *   NEXT_PUBLIC_ORDERS_API=https://accfbapi.accfb-ads.com
  *   NEXT_PUBLIC_MESSAGES_API=https://accfbapi.accfb-ads.com
+ *   LINE_CHANNEL_ID / LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN
+ *   LINE_ADMIN_USER_ID (optional)
  */
 
 const ORDERS_API = (process.env.NEXT_PUBLIC_ORDERS_API || "https://accfbapi.accfb-ads.com").replace(/\/+$/, "");
 const MESSAGES_API = (process.env.NEXT_PUBLIC_MESSAGES_API || ORDERS_API).replace(/\/+$/, "");
+const POLL_MS = 10000;
 
 /** ----------------- Helpers ----------------- */
 async function toJsonOrThrow(res) {
@@ -30,17 +33,15 @@ async function toJsonOrThrow(res) {
 
 async function fetchOrdersRaw() {
   const res = await fetch(`${ORDERS_API}/get`, { cache: "no-store" });
-  return toJsonOrThrow(res); // -> array of orders
+  return toJsonOrThrow(res);
 }
 
-/** Hide rows that are soft-deleted/cancelled so they don't reappear after refresh */
 function filterVisibleOrders(list) {
   return (Array.isArray(list) ? list : []).filter(
     (o) => !["DELETED", "CANCELLED"].includes(String(o?.status || "").toUpperCase())
   );
 }
 
-/** Save admin message into detels of specific order */
 async function saveDetels(orderId, text) {
   const res = await fetch(`${MESSAGES_API}/messages/${orderId}`, {
     method: "PUT",
@@ -50,13 +51,7 @@ async function saveDetels(orderId, text) {
   return toJsonOrThrow(res);
 }
 
-/**
- * Soft delete order:
- * 1) Try real DELETE endpoints (if the external API supports).
- * 2) Otherwise PATCH status to "DELETED" (preferred) or "CANCELLED" as fallback.
- */
 async function softDeleteOrder(id) {
-  // Try a few common delete endpoints…
   try {
     const r1 = await fetch(`${ORDERS_API}/orders/${id}`, { method: "DELETE" });
     if (r1.ok) return true;
@@ -70,7 +65,6 @@ async function softDeleteOrder(id) {
     if (r3.ok) return true;
   } catch {}
 
-  // No real delete? → Soft delete to DELETED (or CANCELLED fallback)
   try {
     const r4 = await fetch(`${ORDERS_API}/status/${id}`, {
       method: "PATCH",
@@ -91,27 +85,69 @@ async function softDeleteOrder(id) {
   throw new Error("ไม่พบ endpoint สำหรับลบ และไม่สามารถเปลี่ยนสถานะได้");
 }
 
+/** ----------------- LINE Messaging API ----------------- */
+async function pushLine({ text, imageUrl, to, broadcast = false }) {
+  const res = await fetch("/api/line/push", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, imageUrl, to, broadcast }),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    console.warn("LINE push failed:", res.status, txt);
+    return false;
+  }
+  return true;
+}
+
+function buildLineMessage(order) {
+  const status = String(order?.status || "-").toUpperCase();
+  const lines = [
+    "🛎️ มีคำสั่งซื้อใหม่เข้ามา",
+    `📦 สินค้า: ${order?.product_name || "-"}`,
+    `🔢 จำนวน: ${order?.qty ?? "-"}`,
+    `💰 รวม: ${Number(order?.total_price || 0).toLocaleString()} บาท`,
+    `👤 ผู้สั่งซื้อ: ${order?.buyer_email || "-"}`,
+    `🕒 เวลา: ${order?.created_at ? new Date(order.created_at).toLocaleString() : "-"}`,
+    `🏷️ สถานะ: ${status}`,
+    order?.order_no ? `#ออเดอร์: ${order.order_no}` : null,
+  ].filter(Boolean);
+  return lines.join("\n");
+}
+
+function diffNewOrders(prevList, nextList) {
+  const prevIds = new Set(prevList.map((o) => o.id));
+  const newly = [];
+  for (const o of nextList) {
+    if (!prevIds.has(o.id)) newly.push(o);
+  }
+  return newly;
+}
+
 export default function AdminPage() {
-  /** Orders table */
   const [orders, setOrders] = useState([]);
   const [loadingOrders, setLoadingOrders] = useState(false);
   const [errorOrders, setErrorOrders] = useState("");
   const [q, setQ] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
 
-  /** Message modal */
   const [showModal, setShowModal] = useState(false);
   const [targetOrder, setTargetOrder] = useState(null);
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
 
-  /** Load orders */
+  const notifiedIdsRef = useRef(new Set());
+  const lastOrdersRef = useRef([]);
+
   const loadOrders = async () => {
     setLoadingOrders(true);
     setErrorOrders("");
     try {
       const data = await fetchOrdersRaw();
-      setOrders(filterVisibleOrders(data));
+      const visible = filterVisibleOrders(data);
+      setOrders(visible);
+      lastOrdersRef.current = visible;
+      for (const o of visible) notifiedIdsRef.current.add(o.id);
     } catch (e) {
       setErrorOrders(e.message || String(e));
     } finally {
@@ -123,7 +159,31 @@ export default function AdminPage() {
     loadOrders();
   }, []);
 
-  /** Search / filter */
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      try {
+        const data = await fetchOrdersRaw();
+        const visible = filterVisibleOrders(data);
+        const newly = diffNewOrders(lastOrdersRef.current, visible);
+
+        setOrders(visible);
+        lastOrdersRef.current = visible;
+
+        for (const o of newly) {
+          if (notifiedIdsRef.current.has(o.id)) continue;
+          const msg = buildLineMessage(o);
+          const img = o?.slip_url || undefined;
+          await pushLine({ text: msg, imageUrl: img });
+          notifiedIdsRef.current.add(o.id);
+        }
+      } catch (e) {
+        console.warn("Polling error:", e?.message || e);
+      }
+    }, POLL_MS);
+
+    return () => clearInterval(timer);
+  }, []);
+
   const filtered = useMemo(() => {
     const qlc = q.trim().toLowerCase();
     return orders.filter((o) => {
@@ -133,7 +193,6 @@ export default function AdminPage() {
         String(o.product_slug || "").toLowerCase().includes(qlc) ||
         String(o.buyer_email || "").toLowerCase().includes(qlc);
 
-      // statusFilter already ignores DELETED/CANCELLED globally.
       const matchStatus =
         statusFilter === "ALL" ? true : String(o.status || "").toUpperCase() === statusFilter;
 
@@ -141,7 +200,6 @@ export default function AdminPage() {
     });
   }, [orders, q, statusFilter]);
 
-  /** Open message modal (detels) */
   const openSend = (o) => {
     setTargetOrder(o);
     const preset = `[ORDER ${o.order_no || "-"}] ${o.product_name || "-"} • ${Number(
@@ -151,7 +209,6 @@ export default function AdminPage() {
     setShowModal(true);
   };
 
-  /** Save message to detels */
   const handleSaveMessage = async () => {
     const text = (message || "").trim();
     if (!text) return alert("กรุณากรอกข้อความ");
@@ -161,8 +218,6 @@ export default function AdminPage() {
       await saveDetels(targetOrder.id, text);
       setShowModal(false);
       setMessage("");
-      // Optional: refresh orders in case detels is displayed somewhere else
-      // await loadOrders();
       alert("บันทึกข้อความเรียบร้อยแล้ว");
     } catch (e) {
       alert(`บันทึกข้อความไม่สำเร็จ: ${e.message || e}`);
@@ -171,15 +226,12 @@ export default function AdminPage() {
     }
   };
 
-  /** Delete (soft delete) */
   const handleDelete = async (o) => {
     if (!o?.id) return alert("ไม่พบรหัสรายการ");
     const ok = confirm(`ยืนยันลบรายการสินค้า "${o.product_name || "-"}" ?`);
     if (!ok) return;
-
     try {
       await softDeleteOrder(o.id);
-      // Optimistic remove
       setOrders((prev) => prev.filter((x) => x.id !== o.id));
       alert("ลบรายการเรียบร้อยแล้ว");
     } catch (e) {
@@ -189,17 +241,13 @@ export default function AdminPage() {
 
   return (
     <div className="container py-5">
-      {/* Header */}
       <div className="d-flex justify-content-between align-items-center mb-4">
         <h1 className="h4 m-0">แผงควบคุมแอดมิน</h1>
         <div className="d-flex gap-2">
-          <Link href="/" className="btn btn-outline-secondary btn-sm">
-            หน้าแรก
-          </Link>
+          <Link href="/" className="btn btn-outline-secondary btn-sm">หน้าแรก</Link>
         </div>
       </div>
 
-      {/* Controls */}
       <div className="card shadow-sm mb-4">
         <div className="card-body">
           <div className="d-flex flex-wrap gap-2 align-items-center">
@@ -219,7 +267,6 @@ export default function AdminPage() {
               <option value="ALL">สถานะทั้งหมด (ยกเว้นที่ถูกลบ/ยกเลิก)</option>
               <option value="PENDING_PAYMENT">PENDING_PAYMENT</option>
               <option value="CONFIRMED">CONFIRMED</option>
-              {/* หมายเหตุ: DELETED/CANCELLED ถูกซ่อนไว้โดยดีฟอลต์ */}
             </select>
             <button
               className="btn btn-sm btn-outline-primary ms-auto"
@@ -233,7 +280,6 @@ export default function AdminPage() {
         </div>
       </div>
 
-      {/* Orders table */}
       <div className="card shadow-sm">
         <div className="card-body">
           <div className="table-responsive">
@@ -241,15 +287,10 @@ export default function AdminPage() {
               <thead className="table-light">
                 <tr>
                   <th style={{ width: 70 }}>#</th>
-                  {/* Slip instead of Order No */}
                   <th style={{ width: 160 }}>สลิป</th>
                   <th>สินค้า</th>
-                  <th className="text-center" style={{ width: 90 }}>
-                    จำนวน
-                  </th>
-                  <th className="text-end" style={{ width: 140 }}>
-                    รวม (บาท)
-                  </th>
+                  <th className="text-center" style={{ width: 90 }}>จำนวน</th>
+                  <th className="text-end" style={{ width: 140 }}>รวม (บาท)</th>
                   <th style={{ width: 150 }}>สถานะ</th>
                   <th style={{ width: 280 }}>ลูกค้า</th>
                   <th style={{ width: 220 }}>การจัดการ</th>
@@ -257,23 +298,13 @@ export default function AdminPage() {
               </thead>
               <tbody>
                 {loadingOrders ? (
-                  <tr>
-                    <td colSpan={8} className="text-center py-4">
-                      กำลังโหลด...
-                    </td>
-                  </tr>
+                  <tr><td colSpan={8} className="text-center py-4">กำลังโหลด...</td></tr>
                 ) : filtered.length === 0 ? (
-                  <tr>
-                    <td colSpan={8} className="text-center py-4">
-                      ไม่พบข้อมูล
-                    </td>
-                  </tr>
+                  <tr><td colSpan={8} className="text-center py-4">ไม่พบข้อมูล</td></tr>
                 ) : (
                   filtered.map((o, idx) => (
                     <tr key={o.id}>
                       <td>{idx + 1}</td>
-
-                      {/* Slip thumbnail */}
                       <td className="text-center">
                         {o.slip_url ? (
                           <a href={o.slip_url} target="_blank" rel="noreferrer" title="เปิดสลิป">
@@ -293,7 +324,6 @@ export default function AdminPage() {
                           <span className="text-muted small">ไม่มีสลิป</span>
                         )}
                       </td>
-
                       <td className="small">
                         <div className="fw-semibold">{o.product_name}</div>
                         <div className="text-muted">{o.product_slug}</div>
@@ -306,7 +336,9 @@ export default function AdminPage() {
                         ) : String(o.status || "").toUpperCase() === "PENDING_PAYMENT" ? (
                           <span className="badge bg-warning text-dark">PENDING_PAYMENT</span>
                         ) : (
-                          <span className="badge bg-secondary">{String(o.status || "").toUpperCase()}</span>
+                          <span className="badge bg-secondary">
+                            {String(o.status || "").toUpperCase()}
+                          </span>
                         )}
                       </td>
                       <td className="small">
@@ -317,16 +349,10 @@ export default function AdminPage() {
                       </td>
                       <td>
                         <div className="d-grid gap-2">
-                          <button
-                            className="btn btn-sm btn-outline-primary"
-                            onClick={() => openSend(o)}
-                          >
+                          <button className="btn btn-sm btn-outline-primary" onClick={() => openSend(o)}>
                             ส่งข้อความ
                           </button>
-                          <button
-                            className="btn btn-sm btn-outline-danger"
-                            onClick={() => handleDelete(o)}
-                          >
+                          <button className="btn btn-sm btn-outline-danger" onClick={() => handleDelete(o)}>
                             ลบ
                           </button>
                         </div>
@@ -344,12 +370,8 @@ export default function AdminPage() {
         </div>
       </div>
 
-      {/* Message Modal */}
       {showModal && (
-        <div
-          className="modal fade show"
-          style={{ display: "block", background: "rgba(0,0,0,.3)" }}
-        >
+        <div className="modal fade show" style={{ display: "block", background: "rgba(0,0,0,.3)" }}>
           <div className="modal-dialog modal-lg modal-dialog-centered">
             <div className="modal-content">
               <div className="modal-header">
@@ -368,8 +390,7 @@ export default function AdminPage() {
               </div>
               <div className="modal-body">
                 <div className="mb-2 small text-muted">
-                  จะถูกบันทึกไปที่ <code>{MESSAGES_API}/messages/{targetOrder?.id ?? "ID"}</code>{" "}
-                  เป็นฟิลด์ <code>detels</code>
+                  จะถูกบันทึกไปที่ <code>{MESSAGES_API}/messages/{targetOrder?.id ?? "ID"}</code> เป็นฟิลด์ <code>detels</code>
                 </div>
                 <textarea
                   className="form-control"
