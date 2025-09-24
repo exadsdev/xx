@@ -112,6 +112,7 @@ async function pushLine({ text, imageUrl, to, broadcast = false }) {
   return true;
 }
 
+
 /** ----------------- Email ----------------- */
 /** เรียก API ส่งอีเมล */
 async function sendEmail({ to, subject, text, html }) {
@@ -242,7 +243,9 @@ export default function AdminPage() {
           if (notifiedIdsRef.current.has(o.id)) continue;
           const msg = buildLineMessage(o);
           const img = o?.slip_url || undefined;
-          await lineNotifySend(msg, img);
+          console.log("[LINE] pushing:", o.id, o.product_name);
+          await pushLine({ text: msg, imageUrl: img });
+
           notifiedIdsRef.current.add(o.id);
         }
       } catch (e) {
